@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//|                                      DonchianBreakoutEA.mq5       |
-//|                         Mechanical Donchian breakout strategy      |
+//|                               DonchianBreakoutEA_v2.mq5          |
+//|                  Donchian breakout with robust trend filter      |
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.10"
+#property version "2.00"
 
 #include <Trade/Trade.mqh>
 
@@ -19,18 +19,27 @@ input bool            InpAllowLong      = true;
 input bool            InpAllowShort     = true;
 
 //==================================================================
-// TREND FILTER
+// TREND FILTER (ROBUST)
 //==================================================================
 
-input bool InpUseTrendFilter = true;
-input int  InpTrendEMAPeriod = 200;
+input bool InpUseTrendFilter   = true;
+input int  InpFastEMAPeriod    = 20;
+input int  InpMidEMAPeriod     = 50;
+input int  InpSlowEMAPeriod    = 200;
+
+//==================================================================
+// VOLATILITY & BREAKOUT QUALITY
+//==================================================================
+
+input int    InpATRPeriod          = 14;
+input double InpMinATRMultiplier   = 0.5;   // min ATR vs average range
+input double InpMinBreakoutRangeATR = 1.0;  // breakout candle size vs ATR
 
 //==================================================================
 // RISK AND INITIAL EXIT
 //==================================================================
 
-input double InpRiskPercent  = 1.00;
-input int    InpATRPeriod    = 14;
+input double InpRiskPercent   = 1.00;
 input double InpInitialSL_ATR = 2.00;
 input double InpTakeProfit_R  = 3.00;
 
@@ -39,7 +48,7 @@ input double InpTakeProfit_R  = 3.00;
 //==================================================================
 
 input bool   InpUseBreakEven       = true;
-input double InpBreakEvenAt_R       = 1.00;
+input double InpBreakEvenAt_R      = 1.00;
 input int    InpBreakEvenOffsetPts = 0;
 
 input bool   InpUseTrailingStop = true;
@@ -50,7 +59,7 @@ input double InpTrailingATR     = 2.00;
 // EXECUTION SETTINGS
 //==================================================================
 
-input long InpMagicNumber     = 50020001;
+input long InpMagicNumber     = 50020002;
 input int  InpDeviationPoints = 20;
 input bool InpOnePositionOnly = true;
 
@@ -59,7 +68,9 @@ input bool InpOnePositionOnly = true;
 //==================================================================
 
 datetime g_lastBarTime = 0;
-int      g_emaHandle   = INVALID_HANDLE;
+int      g_fastEMAHandle = INVALID_HANDLE;
+int      g_midEMAHandle  = INVALID_HANDLE;
+int      g_slowEMAHandle = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                             |
@@ -68,7 +79,9 @@ int OnInit()
 {
    if(InpDonchianPeriod < 2 ||
       InpATRPeriod < 2 ||
-      InpTrendEMAPeriod < 2 ||
+      InpFastEMAPeriod < 2 ||
+      InpMidEMAPeriod < 2 ||
+      InpSlowEMAPeriod < 2 ||
       InpRiskPercent <= 0.0 ||
       InpInitialSL_ATR <= 0.0 ||
       InpTakeProfit_R <= 0.0)
@@ -82,32 +95,28 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
    trade.SetMarginMode();
 
-   g_emaHandle = iMA(
-      _Symbol,
-      InpTimeframe,
-      InpTrendEMAPeriod,
-      0,
-      MODE_EMA,
-      PRICE_CLOSE
-   );
+   g_fastEMAHandle = iMA(_Symbol, InpTimeframe, InpFastEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_midEMAHandle  = iMA(_Symbol, InpTimeframe, InpMidEMAPeriod,  0, MODE_EMA, PRICE_CLOSE);
+   g_slowEMAHandle = iMA(_Symbol, InpTimeframe, InpSlowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
 
-   if(g_emaHandle == INVALID_HANDLE)
+   if(g_fastEMAHandle == INVALID_HANDLE ||
+      g_midEMAHandle  == INVALID_HANDLE ||
+      g_slowEMAHandle == INVALID_HANDLE)
    {
-      PrintFormat(
-         "EMA handle creation failed. Error=%d",
-         GetLastError()
-      );
-
+      PrintFormat("EMA handle creation failed. Error=%d", GetLastError());
       return INIT_FAILED;
    }
 
    g_lastBarTime = iTime(_Symbol, InpTimeframe, 0);
 
    PrintFormat(
-      "DonchianBreakoutEA initialized: symbol=%s timeframe=%s EMA=%d",
+      "DonchianBreakoutEA_v2 initialized: symbol=%s timeframe=%s Donchian=%d FastEMA=%d MidEMA=%d SlowEMA=%d",
       _Symbol,
       EnumToString(InpTimeframe),
-      InpTrendEMAPeriod
+      InpDonchianPeriod,
+      InpFastEMAPeriod,
+      InpMidEMAPeriod,
+      InpSlowEMAPeriod
    );
 
    return INIT_SUCCEEDED;
@@ -118,11 +127,16 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(g_emaHandle != INVALID_HANDLE)
-   {
-      IndicatorRelease(g_emaHandle);
-      g_emaHandle = INVALID_HANDLE;
-   }
+   if(g_fastEMAHandle != INVALID_HANDLE)
+      IndicatorRelease(g_fastEMAHandle);
+   if(g_midEMAHandle != INVALID_HANDLE)
+      IndicatorRelease(g_midEMAHandle);
+   if(g_slowEMAHandle != INVALID_HANDLE)
+      IndicatorRelease(g_slowEMAHandle);
+
+   g_fastEMAHandle = INVALID_HANDLE;
+   g_midEMAHandle  = INVALID_HANDLE;
+   g_slowEMAHandle = INVALID_HANDLE;
 }
 
 //+------------------------------------------------------------------+
@@ -167,25 +181,20 @@ void CheckForEntry()
       return;
 
    int requiredBars = MathMax(
-      InpDonchianPeriod + 3,
-      MathMax(InpATRPeriod + 3, InpTrendEMAPeriod + 3)
+      InpDonchianPeriod + 5,
+      MathMax(InpATRPeriod + 5, InpSlowEMAPeriod + 5)
    );
 
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
 
-   if(CopyRates(
-      _Symbol,
-      InpTimeframe,
-      0,
-      requiredBars,
-      rates
-   ) < requiredBars)
+   if(CopyRates(_Symbol, InpTimeframe, 0, requiredBars, rates) < requiredBars)
    {
       Print("Not enough historical bars.");
       return;
    }
 
+   // Donchian channel (use previous bars, avoid current forming bar)
    double channelHigh = rates[2].high;
    double channelLow  = rates[2].low;
 
@@ -193,30 +202,39 @@ void CheckForEntry()
    {
       if(rates[i].high > channelHigh)
          channelHigh = rates[i].high;
-
       if(rates[i].low < channelLow)
          channelLow = rates[i].low;
    }
 
    double signalClose = rates[1].close;
-   double trendEMA    = 0.0;
+
+   // Robust trend filter
+   bool longTrendAllowed = true;
+   bool shortTrendAllowed = true;
 
    if(InpUseTrendFilter)
    {
-      trendEMA = GetEMAValue(1);
+      double fastEMA = GetEMAValue(g_fastEMAHandle, 1);
+      double midEMA  = GetEMAValue(g_midEMAHandle,  1);
+      double slowEMA = GetEMAValue(g_slowEMAHandle, 1);
 
-      if(trendEMA <= 0.0)
+      if(fastEMA <= 0.0 || midEMA <= 0.0 || slowEMA <= 0.0)
       {
-         Print("EMA value is unavailable.");
+         Print("EMA values unavailable.");
          return;
       }
+
+      // EMA alignment: strong trend only
+      longTrendAllowed =
+         (signalClose > fastEMA) &&
+         (fastEMA > midEMA) &&
+         (midEMA > slowEMA);
+
+      shortTrendAllowed =
+         (signalClose < fastEMA) &&
+         (fastEMA < midEMA) &&
+         (midEMA < slowEMA);
    }
-
-   bool longTrendAllowed =
-      !InpUseTrendFilter || signalClose > trendEMA;
-
-   bool shortTrendAllowed =
-      !InpUseTrendFilter || signalClose < trendEMA;
 
    bool longSignal =
       InpAllowLong &&
@@ -231,16 +249,40 @@ void CheckForEntry()
    if(!longSignal && !shortSignal)
       return;
 
+   // Volatility filter (ATR)
    double atr = CalculateATR(1, InpATRPeriod);
-
    if(atr <= 0.0)
    {
       Print("ATR calculation failed.");
       return;
    }
 
-   MqlTick tick;
+   // Check breakout candle quality vs ATR
+   double breakoutRange =
+      rates[1].high - rates[1].low;
 
+   if(breakoutRange < atr * InpMinBreakoutRangeATR)
+   {
+      // too small candle → likely false breakout
+      PrintFormat("Breakout candle too small: range=%.5f ATR=%.5f", breakoutRange, atr);
+      return;
+   }
+
+   // Check average range vs ATR (avoid dead markets)
+   double avgRange = 0.0;
+   int rangeBars = MathMin(InpATRPeriod, requiredBars - 2);
+   for(int i = 1; i <= rangeBars; i++)
+      avgRange += (rates[i].high - rates[i].low);
+   avgRange /= (double)rangeBars;
+
+   if(atr < avgRange * InpMinATRMultiplier)
+   {
+      // volatility too low → no edge
+      PrintFormat("ATR too low vs avg range: ATR=%.5f AvgRange=%.5f", atr, avgRange);
+      return;
+   }
+
+   MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
    {
       Print("SymbolInfoTick failed.");
@@ -252,9 +294,7 @@ void CheckForEntry()
       OpenPosition(
          ORDER_TYPE_BUY,
          tick.ask,
-         atr,
-         channelHigh,
-         channelLow
+         atr
       );
    }
    else if(shortSignal)
@@ -262,9 +302,7 @@ void CheckForEntry()
       OpenPosition(
          ORDER_TYPE_SELL,
          tick.bid,
-         atr,
-         channelHigh,
-         channelLow
+         atr
       );
    }
 }
@@ -272,9 +310,9 @@ void CheckForEntry()
 //+------------------------------------------------------------------+
 //| Get EMA value                                                     |
 //+------------------------------------------------------------------+
-double GetEMAValue(const int shift)
+double GetEMAValue(const int handle, const int shift)
 {
-   if(g_emaHandle == INVALID_HANDLE)
+   if(handle == INVALID_HANDLE)
       return 0.0;
 
    double emaBuffer[];
@@ -282,19 +320,9 @@ double GetEMAValue(const int shift)
 
    ResetLastError();
 
-   if(CopyBuffer(
-      g_emaHandle,
-      0,
-      shift,
-      1,
-      emaBuffer
-   ) != 1)
+   if(CopyBuffer(handle, 0, shift, 1, emaBuffer) != 1)
    {
-      PrintFormat(
-         "EMA CopyBuffer failed. Error=%d",
-         GetLastError()
-      );
-
+      PrintFormat("EMA CopyBuffer failed. Error=%d", GetLastError());
       return 0.0;
    }
 
@@ -307,28 +335,20 @@ double GetEMAValue(const int shift)
 void OpenPosition(
    const ENUM_ORDER_TYPE orderType,
    const double entryPrice,
-   const double atr,
-   const double channelHigh,
-   const double channelLow
+   const double atr
 )
 {
-   bool isBuy = orderType == ORDER_TYPE_BUY;
+   bool isBuy = (orderType == ORDER_TYPE_BUY);
 
-   double initialRiskDistance =
-      atr * InpInitialSL_ATR;
+   double initialRiskDistance = atr * InpInitialSL_ATR;
 
    double stopLoss = isBuy
       ? entryPrice - initialRiskDistance
       : entryPrice + initialRiskDistance;
 
-   stopLoss = AdjustInitialStop(
-      orderType,
-      stopLoss
-   );
+   stopLoss = AdjustInitialStop(orderType, stopLoss);
 
-   double actualRiskDistance =
-      MathAbs(entryPrice - stopLoss);
-
+   double actualRiskDistance = MathAbs(entryPrice - stopLoss);
    if(actualRiskDistance <= 0.0)
    {
       Print("Invalid initial stop-loss distance.");
@@ -342,12 +362,7 @@ void OpenPosition(
    stopLoss   = NormalizePrice(stopLoss);
    takeProfit = NormalizePrice(takeProfit);
 
-   double volume = CalculateRiskVolume(
-      orderType,
-      entryPrice,
-      stopLoss
-   );
-
+   double volume = CalculateRiskVolume(orderType, entryPrice, stopLoss);
    if(volume <= 0.0)
    {
       Print("Calculated volume is invalid.");
@@ -355,9 +370,11 @@ void OpenPosition(
    }
 
    string comment = StringFormat(
-      "Donchian %d EMA %d",
+      "Donchian_v2 %d FastEMA %d MidEMA %d SlowEMA %d",
       InpDonchianPeriod,
-      InpTrendEMAPeriod
+      InpFastEMAPeriod,
+      InpMidEMAPeriod,
+      InpSlowEMAPeriod
    );
 
    bool requestSent = false;
@@ -392,7 +409,6 @@ void OpenPosition(
          trade.ResultRetcode(),
          trade.ResultRetcodeDescription()
       );
-
       return;
    }
 
@@ -412,7 +428,6 @@ void OpenPosition(
 void ManageOpenPosition()
 {
    ulong ticket = FindOurPosition();
-
    if(ticket == 0)
       return;
 
@@ -436,15 +451,12 @@ void ManageOpenPosition()
       return;
 
    MqlTick tick;
-
    if(!SymbolInfoTick(_Symbol, tick))
       return;
 
-   bool isBuy = positionType == POSITION_TYPE_BUY;
+   bool isBuy = (positionType == POSITION_TYPE_BUY);
 
-   double currentPrice = isBuy
-      ? tick.bid
-      : tick.ask;
+   double currentPrice = isBuy ? tick.bid : tick.ask;
 
    double profitDistance = isBuy
       ? currentPrice - openPrice
@@ -480,7 +492,6 @@ void ManageOpenPosition()
       profitDistance >= initialRiskDistance * InpTrailingStart_R)
    {
       double atr = CalculateATR(1, InpATRPeriod);
-
       if(atr > 0.0)
       {
          double trailingSL = isBuy
@@ -498,22 +509,14 @@ void ManageOpenPosition()
    if(!shouldModify)
       return;
 
-   candidateSL = AdjustManagedStop(
-      isBuy,
-      candidateSL,
-      tick
-   );
-
+   candidateSL = AdjustManagedStop(isBuy, candidateSL, tick);
    candidateSL = NormalizePrice(candidateSL);
 
    if(!IsBetterStop(isBuy, candidateSL, currentSL))
       return;
 
-   if(!trade.PositionModify(
-      ticket,
-      candidateSL,
-      takeProfit
-   ) || !IsTradeRetcodeSuccessful())
+   if(!trade.PositionModify(ticket, candidateSL, takeProfit) ||
+      !IsTradeRetcodeSuccessful())
    {
       PrintFormat(
          "Position modification failed. Ticket=%I64u Retcode=%u Description=%s",
@@ -521,7 +524,6 @@ void ManageOpenPosition()
          trade.ResultRetcode(),
          trade.ResultRetcodeDescription()
       );
-
       return;
    }
 
@@ -536,44 +538,25 @@ void ManageOpenPosition()
 //+------------------------------------------------------------------+
 //| Calculate ATR                                                     |
 //+------------------------------------------------------------------+
-double CalculateATR(
-   const int shift,
-   const int period
-)
+double CalculateATR(const int shift, const int period)
 {
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
 
    int requiredBars = shift + period + 1;
 
-   if(CopyRates(
-      _Symbol,
-      InpTimeframe,
-      0,
-      requiredBars,
-      rates
-   ) < requiredBars)
-   {
+   if(CopyRates(_Symbol, InpTimeframe, 0, requiredBars, rates) < requiredBars)
       return 0.0;
-   }
 
    double trueRangeSum = 0.0;
 
    for(int i = shift; i < shift + period; i++)
    {
-      double highLow =
-         rates[i].high - rates[i].low;
+      double highLow  = rates[i].high - rates[i].low;
+      double highClose = MathAbs(rates[i].high - rates[i + 1].close);
+      double lowClose  = MathAbs(rates[i].low  - rates[i + 1].close);
 
-      double highClose =
-         MathAbs(rates[i].high - rates[i + 1].close);
-
-      double lowClose =
-         MathAbs(rates[i].low - rates[i + 1].close);
-
-      trueRangeSum += MathMax(
-         highLow,
-         MathMax(highClose, lowClose)
-      );
+      trueRangeSum += MathMax(highLow, MathMax(highClose, lowClose));
    }
 
    return trueRangeSum / period;
@@ -609,18 +592,14 @@ double CalculateRiskVolume(
          "OrderCalcProfit failed. Error=%d",
          GetLastError()
       );
-
       return 0.0;
    }
 
-   double lossForOneLot =
-      MathAbs(profitForOneLot);
-
+   double lossForOneLot = MathAbs(profitForOneLot);
    if(lossForOneLot <= 0.0)
       return 0.0;
 
-   double rawVolume =
-      riskMoney / lossForOneLot;
+   double rawVolume = riskMoney / lossForOneLot;
 
    return NormalizeVolume(rawVolume);
 }
@@ -632,19 +611,15 @@ double NormalizeVolume(const double rawVolume)
 {
    double minVolume =
       SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-
    double maxVolume =
       SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-
    double volumeStep =
       SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
    if(minVolume <= 0.0 ||
       maxVolume <= 0.0 ||
       volumeStep <= 0.0)
-   {
       return 0.0;
-   }
 
    if(rawVolume < minVolume)
    {
@@ -653,15 +628,11 @@ double NormalizeVolume(const double rawVolume)
          rawVolume,
          minVolume
       );
-
       return 0.0;
    }
 
-   double volume =
-      MathMin(rawVolume, maxVolume);
-
-   volume =
-      MathFloor(volume / volumeStep) * volumeStep;
+   double volume = MathMin(rawVolume, maxVolume);
+   volume = MathFloor(volume / volumeStep) * volumeStep;
 
    int volumeDigits = 0;
    double step = volumeStep;
@@ -672,10 +643,7 @@ double NormalizeVolume(const double rawVolume)
       volumeDigits++;
    }
 
-   return NormalizeDouble(
-      volume,
-      volumeDigits
-   );
+   return NormalizeDouble(volume, volumeDigits);
 }
 
 //+------------------------------------------------------------------+
@@ -686,21 +654,14 @@ ulong FindOurPosition()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-
       if(ticket == 0)
          continue;
 
-      string symbol =
-         PositionGetString(POSITION_SYMBOL);
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      long   magic  = PositionGetInteger(POSITION_MAGIC);
 
-      long magic =
-         PositionGetInteger(POSITION_MAGIC);
-
-      if(symbol == _Symbol &&
-         magic == InpMagicNumber)
-      {
+      if(symbol == _Symbol && magic == InpMagicNumber)
          return ticket;
-      }
    }
 
    return 0;
@@ -714,7 +675,6 @@ bool HasAnyPositionOnSymbol()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-
       if(ticket == 0)
          continue;
 
@@ -755,12 +715,10 @@ double AdjustInitialStop(
 )
 {
    MqlTick tick;
-
    if(!SymbolInfoTick(_Symbol, tick))
       return proposedSL;
 
-   double minDistance =
-      GetMinimumStopDistance();
+   double minDistance = GetMinimumStopDistance();
 
    if(orderType == ORDER_TYPE_BUY)
       return MathMin(proposedSL, tick.bid - minDistance);
@@ -777,8 +735,7 @@ double AdjustManagedStop(
    const MqlTick &tick
 )
 {
-   double minDistance =
-      GetMinimumStopDistance();
+   double minDistance = GetMinimumStopDistance();
 
    if(isBuy)
       return MathMin(proposedSL, tick.bid - minDistance);
@@ -796,12 +753,10 @@ double GetMinimumStopDistance()
 
    long stopsLevel =
       SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-
    long freezeLevel =
       SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
 
-   long requiredPoints =
-      MathMax(stopsLevel, freezeLevel);
+   long requiredPoints = MathMax(stopsLevel, freezeLevel);
 
    return requiredPoints * point;
 }
@@ -813,7 +768,6 @@ double NormalizePrice(const double price)
 {
    double tickSize =
       SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-
    int digits =
       (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
@@ -823,10 +777,7 @@ double NormalizePrice(const double price)
    double normalized =
       MathRound(price / tickSize) * tickSize;
 
-   return NormalizeDouble(
-      normalized,
-      digits
-   );
+   return NormalizeDouble(normalized, digits);
 }
 
 //+------------------------------------------------------------------+
