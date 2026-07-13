@@ -3,41 +3,63 @@
 //|                         Mechanical Donchian breakout strategy      |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
-#property description "Donchian breakout EA with risk-based sizing, ATR SL, TP, break-even and ATR trailing stop."
+#property version "1.10"
 
 #include <Trade/Trade.mqh>
 
 CTrade trade;
 
-//--- Strategy settings
-input ENUM_TIMEFRAMES InpTimeframe          = PERIOD_D1;
-input int             InpDonchianPeriod     = 20;
-input bool            InpAllowLong          = true;
-input bool            InpAllowShort         = true;
+//==================================================================
+// STRATEGY SETTINGS
+//==================================================================
 
-//--- Risk and initial exit settings
-input double          InpRiskPercent        = 1.00;
-input int             InpATRPeriod          = 14;
-input double          InpInitialSL_ATR       = 2.00;
-input double          InpTakeProfit_R        = 3.00;
+input ENUM_TIMEFRAMES InpTimeframe      = PERIOD_D1;
+input int             InpDonchianPeriod = 20;
+input bool            InpAllowLong      = true;
+input bool            InpAllowShort     = true;
 
-//--- Position management
-input bool            InpUseBreakEven       = true;
-input double          InpBreakEvenAt_R       = 1.00;
-input int             InpBreakEvenOffsetPts = 0;
+//==================================================================
+// TREND FILTER
+//==================================================================
 
-input bool            InpUseTrailingStop     = true;
-input double          InpTrailingStart_R     = 1.50;
-input double          InpTrailingATR         = 2.00;
+input bool InpUseTrendFilter = true;
+input int  InpTrendEMAPeriod = 200;
 
-//--- Execution settings
-input long            InpMagicNumber         = 50020001;
-input int             InpDeviationPoints     = 20;
-input bool            InpOnePositionOnly     = true;
+//==================================================================
+// RISK AND INITIAL EXIT
+//==================================================================
 
-//--- Internal state
+input double InpRiskPercent  = 1.00;
+input int    InpATRPeriod    = 14;
+input double InpInitialSL_ATR = 2.00;
+input double InpTakeProfit_R  = 3.00;
+
+//==================================================================
+// POSITION MANAGEMENT
+//==================================================================
+
+input bool   InpUseBreakEven       = true;
+input double InpBreakEvenAt_R       = 1.00;
+input int    InpBreakEvenOffsetPts = 0;
+
+input bool   InpUseTrailingStop = true;
+input double InpTrailingStart_R = 1.50;
+input double InpTrailingATR     = 2.00;
+
+//==================================================================
+// EXECUTION SETTINGS
+//==================================================================
+
+input long InpMagicNumber     = 50020001;
+input int  InpDeviationPoints = 20;
+input bool InpOnePositionOnly = true;
+
+//==================================================================
+// INTERNAL STATE
+//==================================================================
+
 datetime g_lastBarTime = 0;
+int      g_emaHandle   = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                             |
@@ -46,6 +68,7 @@ int OnInit()
 {
    if(InpDonchianPeriod < 2 ||
       InpATRPeriod < 2 ||
+      InpTrendEMAPeriod < 2 ||
       InpRiskPercent <= 0.0 ||
       InpInitialSL_ATR <= 0.0 ||
       InpTakeProfit_R <= 0.0)
@@ -59,12 +82,47 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
    trade.SetMarginMode();
 
+   g_emaHandle = iMA(
+      _Symbol,
+      InpTimeframe,
+      InpTrendEMAPeriod,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
+
+   if(g_emaHandle == INVALID_HANDLE)
+   {
+      PrintFormat(
+         "EMA handle creation failed. Error=%d",
+         GetLastError()
+      );
+
+      return INIT_FAILED;
+   }
+
    g_lastBarTime = iTime(_Symbol, InpTimeframe, 0);
 
-   PrintFormat("DonchianBreakoutEA initialized: symbol=%s timeframe=%s",
-               _Symbol, EnumToString(InpTimeframe));
+   PrintFormat(
+      "DonchianBreakoutEA initialized: symbol=%s timeframe=%s EMA=%d",
+      _Symbol,
+      EnumToString(InpTimeframe),
+      InpTrendEMAPeriod
+   );
 
    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(g_emaHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_emaHandle);
+      g_emaHandle = INVALID_HANDLE;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -79,7 +137,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Detect a newly opened bar                                         |
+//| Detect new candle                                                 |
 //+------------------------------------------------------------------+
 bool IsNewBar()
 {
@@ -98,7 +156,7 @@ bool IsNewBar()
 }
 
 //+------------------------------------------------------------------+
-//| Evaluate Donchian breakout on the last closed candle              |
+//| Check Donchian breakout signal                                    |
 //+------------------------------------------------------------------+
 void CheckForEntry()
 {
@@ -108,20 +166,26 @@ void CheckForEntry()
    if(FindOurPosition() != 0)
       return;
 
-   const int requiredBars = MathMax(InpDonchianPeriod + 3,
-                                    InpATRPeriod + 3);
+   int requiredBars = MathMax(
+      InpDonchianPeriod + 3,
+      MathMax(InpATRPeriod + 3, InpTrendEMAPeriod + 3)
+   );
 
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
 
-   if(CopyRates(_Symbol, InpTimeframe, 0, requiredBars, rates) < requiredBars)
+   if(CopyRates(
+      _Symbol,
+      InpTimeframe,
+      0,
+      requiredBars,
+      rates
+   ) < requiredBars)
    {
-      Print("Not enough historical bars for signal calculation.");
+      Print("Not enough historical bars.");
       return;
    }
 
-   // Signal candle: rates[1].
-   // Donchian channel: preceding closed candles rates[2] ... rates[N+1].
    double channelHigh = rates[2].high;
    double channelLow  = rates[2].low;
 
@@ -134,14 +198,41 @@ void CheckForEntry()
          channelLow = rates[i].low;
    }
 
-   const double signalClose = rates[1].close;
-   const bool longSignal  = InpAllowLong  && signalClose > channelHigh;
-   const bool shortSignal = InpAllowShort && signalClose < channelLow;
+   double signalClose = rates[1].close;
+   double trendEMA    = 0.0;
+
+   if(InpUseTrendFilter)
+   {
+      trendEMA = GetEMAValue(1);
+
+      if(trendEMA <= 0.0)
+      {
+         Print("EMA value is unavailable.");
+         return;
+      }
+   }
+
+   bool longTrendAllowed =
+      !InpUseTrendFilter || signalClose > trendEMA;
+
+   bool shortTrendAllowed =
+      !InpUseTrendFilter || signalClose < trendEMA;
+
+   bool longSignal =
+      InpAllowLong &&
+      signalClose > channelHigh &&
+      longTrendAllowed;
+
+   bool shortSignal =
+      InpAllowShort &&
+      signalClose < channelLow &&
+      shortTrendAllowed;
 
    if(!longSignal && !shortSignal)
       return;
 
-   const double atr = CalculateATR(1, InpATRPeriod);
+   double atr = CalculateATR(1, InpATRPeriod);
+
    if(atr <= 0.0)
    {
       Print("ATR calculation failed.");
@@ -149,6 +240,7 @@ void CheckForEntry()
    }
 
    MqlTick tick;
+
    if(!SymbolInfoTick(_Symbol, tick))
    {
       Print("SymbolInfoTick failed.");
@@ -156,30 +248,87 @@ void CheckForEntry()
    }
 
    if(longSignal)
-      OpenPosition(ORDER_TYPE_BUY, tick.ask, atr, channelHigh, channelLow);
+   {
+      OpenPosition(
+         ORDER_TYPE_BUY,
+         tick.ask,
+         atr,
+         channelHigh,
+         channelLow
+      );
+   }
    else if(shortSignal)
-      OpenPosition(ORDER_TYPE_SELL, tick.bid, atr, channelHigh, channelLow);
+   {
+      OpenPosition(
+         ORDER_TYPE_SELL,
+         tick.bid,
+         atr,
+         channelHigh,
+         channelLow
+      );
+   }
 }
 
 //+------------------------------------------------------------------+
-//| Open a market position                                            |
+//| Get EMA value                                                     |
 //+------------------------------------------------------------------+
-void OpenPosition(const ENUM_ORDER_TYPE orderType,
-                  const double entryPrice,
-                  const double atr,
-                  const double channelHigh,
-                  const double channelLow)
+double GetEMAValue(const int shift)
 {
-   const bool isBuy = (orderType == ORDER_TYPE_BUY);
-   const double initialRiskDistance = atr * InpInitialSL_ATR;
+   if(g_emaHandle == INVALID_HANDLE)
+      return 0.0;
+
+   double emaBuffer[];
+   ArraySetAsSeries(emaBuffer, true);
+
+   ResetLastError();
+
+   if(CopyBuffer(
+      g_emaHandle,
+      0,
+      shift,
+      1,
+      emaBuffer
+   ) != 1)
+   {
+      PrintFormat(
+         "EMA CopyBuffer failed. Error=%d",
+         GetLastError()
+      );
+
+      return 0.0;
+   }
+
+   return emaBuffer[0];
+}
+
+//+------------------------------------------------------------------+
+//| Open position                                                     |
+//+------------------------------------------------------------------+
+void OpenPosition(
+   const ENUM_ORDER_TYPE orderType,
+   const double entryPrice,
+   const double atr,
+   const double channelHigh,
+   const double channelLow
+)
+{
+   bool isBuy = orderType == ORDER_TYPE_BUY;
+
+   double initialRiskDistance =
+      atr * InpInitialSL_ATR;
 
    double stopLoss = isBuy
-                     ? entryPrice - initialRiskDistance
-                     : entryPrice + initialRiskDistance;
+      ? entryPrice - initialRiskDistance
+      : entryPrice + initialRiskDistance;
 
-   stopLoss = AdjustInitialStop(orderType, stopLoss);
+   stopLoss = AdjustInitialStop(
+      orderType,
+      stopLoss
+   );
 
-   const double actualRiskDistance = MathAbs(entryPrice - stopLoss);
+   double actualRiskDistance =
+      MathAbs(entryPrice - stopLoss);
+
    if(actualRiskDistance <= 0.0)
    {
       Print("Invalid initial stop-loss distance.");
@@ -187,103 +336,137 @@ void OpenPosition(const ENUM_ORDER_TYPE orderType,
    }
 
    double takeProfit = isBuy
-                       ? entryPrice + actualRiskDistance * InpTakeProfit_R
-                       : entryPrice - actualRiskDistance * InpTakeProfit_R;
+      ? entryPrice + actualRiskDistance * InpTakeProfit_R
+      : entryPrice - actualRiskDistance * InpTakeProfit_R;
 
    stopLoss   = NormalizePrice(stopLoss);
    takeProfit = NormalizePrice(takeProfit);
 
-   const double volume = CalculateRiskVolume(orderType, entryPrice, stopLoss);
+   double volume = CalculateRiskVolume(
+      orderType,
+      entryPrice,
+      stopLoss
+   );
+
    if(volume <= 0.0)
    {
-      Print("Calculated trade volume is invalid.");
+      Print("Calculated volume is invalid.");
       return;
    }
 
-   const string comment = StringFormat("Donchian %d | H=%.5f L=%.5f",
-                                       InpDonchianPeriod,
-                                       channelHigh,
-                                       channelLow);
+   string comment = StringFormat(
+      "Donchian %d EMA %d",
+      InpDonchianPeriod,
+      InpTrendEMAPeriod
+   );
 
    bool requestSent = false;
 
    if(isBuy)
-      requestSent = trade.Buy(volume, _Symbol, 0.0, stopLoss, takeProfit, comment);
+   {
+      requestSent = trade.Buy(
+         volume,
+         _Symbol,
+         0.0,
+         stopLoss,
+         takeProfit,
+         comment
+      );
+   }
    else
-      requestSent = trade.Sell(volume, _Symbol, 0.0, stopLoss, takeProfit, comment);
+   {
+      requestSent = trade.Sell(
+         volume,
+         _Symbol,
+         0.0,
+         stopLoss,
+         takeProfit,
+         comment
+      );
+   }
 
    if(!requestSent || !IsTradeRetcodeSuccessful())
    {
-      PrintFormat("Entry failed. retcode=%u (%s)",
-                  trade.ResultRetcode(),
-                  trade.ResultRetcodeDescription());
+      PrintFormat(
+         "Entry failed. Retcode=%u, description=%s",
+         trade.ResultRetcode(),
+         trade.ResultRetcodeDescription()
+      );
+
       return;
    }
 
-   PrintFormat("%s opened: volume=%.2f entry=%.5f SL=%.5f TP=%.5f",
-               isBuy ? "BUY" : "SELL",
-               volume,
-               trade.ResultPrice(),
-               stopLoss,
-               takeProfit);
+   PrintFormat(
+      "%s opened: volume=%.2f entry=%.5f SL=%.5f TP=%.5f",
+      isBuy ? "BUY" : "SELL",
+      volume,
+      trade.ResultPrice(),
+      stopLoss,
+      takeProfit
+   );
 }
 
 //+------------------------------------------------------------------+
-//| Manage break-even and trailing stop                               |
+//| Manage open position                                              |
 //+------------------------------------------------------------------+
 void ManageOpenPosition()
 {
-   const ulong ticket = FindOurPosition();
+   ulong ticket = FindOurPosition();
+
    if(ticket == 0)
       return;
 
    if(!PositionSelectByTicket(ticket))
       return;
 
-   const ENUM_POSITION_TYPE positionType =
+   ENUM_POSITION_TYPE positionType =
       (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
-   const double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-   const double currentSL = PositionGetDouble(POSITION_SL);
-   const double takeProfit = PositionGetDouble(POSITION_TP);
+   double openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+   double currentSL  = PositionGetDouble(POSITION_SL);
+   double takeProfit = PositionGetDouble(POSITION_TP);
 
    if(openPrice <= 0.0 || takeProfit <= 0.0)
       return;
 
-   // Since TP is fixed at InpTakeProfit_R, the original 1R distance can
-   // be reconstructed even after the stop-loss has been moved.
-   const double initialRiskDistance =
+   double initialRiskDistance =
       MathAbs(takeProfit - openPrice) / InpTakeProfit_R;
 
    if(initialRiskDistance <= 0.0)
       return;
 
    MqlTick tick;
+
    if(!SymbolInfoTick(_Symbol, tick))
       return;
 
-   const bool isBuy = (positionType == POSITION_TYPE_BUY);
-   const double currentPrice = isBuy ? tick.bid : tick.ask;
-   const double profitDistance = isBuy
-                                 ? currentPrice - openPrice
-                                 : openPrice - currentPrice;
+   bool isBuy = positionType == POSITION_TYPE_BUY;
+
+   double currentPrice = isBuy
+      ? tick.bid
+      : tick.ask;
+
+   double profitDistance = isBuy
+      ? currentPrice - openPrice
+      : openPrice - currentPrice;
 
    if(profitDistance <= 0.0)
       return;
 
    double candidateSL = currentSL;
-   bool shouldModify = false;
+   bool shouldModify  = false;
 
-   //--- Break-even
+   // Break-even
    if(InpUseBreakEven &&
       profitDistance >= initialRiskDistance * InpBreakEvenAt_R)
    {
-      const double offset =
-         InpBreakEvenOffsetPts * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double offset =
+         InpBreakEvenOffsetPts *
+         SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
-      const double breakEvenSL = isBuy
-                                 ? openPrice + offset
-                                 : openPrice - offset;
+      double breakEvenSL = isBuy
+         ? openPrice + offset
+         : openPrice - offset;
 
       if(IsBetterStop(isBuy, breakEvenSL, candidateSL))
       {
@@ -292,17 +475,17 @@ void ManageOpenPosition()
       }
    }
 
-   //--- ATR trailing stop
+   // ATR trailing stop
    if(InpUseTrailingStop &&
       profitDistance >= initialRiskDistance * InpTrailingStart_R)
    {
-      const double atr = CalculateATR(1, InpATRPeriod);
+      double atr = CalculateATR(1, InpATRPeriod);
 
       if(atr > 0.0)
       {
-         const double trailingSL = isBuy
-                                   ? currentPrice - atr * InpTrailingATR
-                                   : currentPrice + atr * InpTrailingATR;
+         double trailingSL = isBuy
+            ? currentPrice - atr * InpTrailingATR
+            : currentPrice + atr * InpTrailingATR;
 
          if(IsBetterStop(isBuy, trailingSL, candidateSL))
          {
@@ -315,113 +498,170 @@ void ManageOpenPosition()
    if(!shouldModify)
       return;
 
-   candidateSL = AdjustManagedStop(isBuy, candidateSL, tick);
+   candidateSL = AdjustManagedStop(
+      isBuy,
+      candidateSL,
+      tick
+   );
+
    candidateSL = NormalizePrice(candidateSL);
 
    if(!IsBetterStop(isBuy, candidateSL, currentSL))
       return;
 
-   if(!trade.PositionModify(ticket, candidateSL, takeProfit) ||
-      !IsTradeRetcodeSuccessful())
+   if(!trade.PositionModify(
+      ticket,
+      candidateSL,
+      takeProfit
+   ) || !IsTradeRetcodeSuccessful())
    {
-      PrintFormat("Position modification failed. ticket=%I64u retcode=%u (%s)",
-                  ticket,
-                  trade.ResultRetcode(),
-                  trade.ResultRetcodeDescription());
+      PrintFormat(
+         "Position modification failed. Ticket=%I64u Retcode=%u Description=%s",
+         ticket,
+         trade.ResultRetcode(),
+         trade.ResultRetcodeDescription()
+      );
+
       return;
    }
 
-   PrintFormat("Stop-loss moved: ticket=%I64u oldSL=%.5f newSL=%.5f",
-               ticket, currentSL, candidateSL);
+   PrintFormat(
+      "Stop-loss moved: ticket=%I64u oldSL=%.5f newSL=%.5f",
+      ticket,
+      currentSL,
+      candidateSL
+   );
 }
 
 //+------------------------------------------------------------------+
-//| Calculate ATR from closed candles                                 |
+//| Calculate ATR                                                     |
 //+------------------------------------------------------------------+
-double CalculateATR(const int shift, const int period)
+double CalculateATR(
+   const int shift,
+   const int period
+)
 {
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
 
-   const int requiredBars = shift + period + 1;
+   int requiredBars = shift + period + 1;
 
-   if(CopyRates(_Symbol, InpTimeframe, 0, requiredBars, rates) < requiredBars)
+   if(CopyRates(
+      _Symbol,
+      InpTimeframe,
+      0,
+      requiredBars,
+      rates
+   ) < requiredBars)
+   {
       return 0.0;
+   }
 
    double trueRangeSum = 0.0;
 
    for(int i = shift; i < shift + period; i++)
    {
-      const double highLow = rates[i].high - rates[i].low;
-      const double highClose =
+      double highLow =
+         rates[i].high - rates[i].low;
+
+      double highClose =
          MathAbs(rates[i].high - rates[i + 1].close);
-      const double lowClose =
+
+      double lowClose =
          MathAbs(rates[i].low - rates[i + 1].close);
 
-      trueRangeSum += MathMax(highLow, MathMax(highClose, lowClose));
+      trueRangeSum += MathMax(
+         highLow,
+         MathMax(highClose, lowClose)
+      );
    }
 
    return trueRangeSum / period;
 }
 
 //+------------------------------------------------------------------+
-//| Risk-based position sizing using broker profit calculation        |
+//| Calculate position size                                           |
 //+------------------------------------------------------------------+
-double CalculateRiskVolume(const ENUM_ORDER_TYPE orderType,
-                           const double entryPrice,
-                           const double stopLoss)
+double CalculateRiskVolume(
+   const ENUM_ORDER_TYPE orderType,
+   const double entryPrice,
+   const double stopLoss
+)
 {
-   const double accountBalance =
+   double accountBalance =
       AccountInfoDouble(ACCOUNT_BALANCE);
 
-   const double riskMoney =
+   double riskMoney =
       accountBalance * InpRiskPercent / 100.0;
 
    double profitForOneLot = 0.0;
 
-   if(!OrderCalcProfit(orderType,
-                       _Symbol,
-                       1.0,
-                       entryPrice,
-                       stopLoss,
-                       profitForOneLot))
+   if(!OrderCalcProfit(
+      orderType,
+      _Symbol,
+      1.0,
+      entryPrice,
+      stopLoss,
+      profitForOneLot
+   ))
    {
-      PrintFormat("OrderCalcProfit failed. Error=%d", GetLastError());
+      PrintFormat(
+         "OrderCalcProfit failed. Error=%d",
+         GetLastError()
+      );
+
       return 0.0;
    }
 
-   const double lossForOneLot = MathAbs(profitForOneLot);
+   double lossForOneLot =
+      MathAbs(profitForOneLot);
+
    if(lossForOneLot <= 0.0)
       return 0.0;
 
-   const double rawVolume = riskMoney / lossForOneLot;
+   double rawVolume =
+      riskMoney / lossForOneLot;
+
    return NormalizeVolume(rawVolume);
 }
 
 //+------------------------------------------------------------------+
-//| Normalize volume to broker limits                                 |
+//| Normalize volume                                                  |
 //+------------------------------------------------------------------+
 double NormalizeVolume(const double rawVolume)
 {
-   const double minVolume =
+   double minVolume =
       SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   const double maxVolume =
+
+   double maxVolume =
       SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   const double volumeStep =
+
+   double volumeStep =
       SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
-   if(minVolume <= 0.0 || maxVolume <= 0.0 || volumeStep <= 0.0)
-      return 0.0;
-
-   if(rawVolume < minVolume)
+   if(minVolume <= 0.0 ||
+      maxVolume <= 0.0 ||
+      volumeStep <= 0.0)
    {
-      PrintFormat("Required volume %.4f is below broker minimum %.4f.",
-                  rawVolume, minVolume);
       return 0.0;
    }
 
-   double volume = MathMin(rawVolume, maxVolume);
-   volume = MathFloor(volume / volumeStep) * volumeStep;
+   if(rawVolume < minVolume)
+   {
+      PrintFormat(
+         "Required volume %.4f is below broker minimum %.4f.",
+         rawVolume,
+         minVolume
+      );
+
+      return 0.0;
+   }
+
+   double volume =
+      MathMin(rawVolume, maxVolume);
+
+   volume =
+      MathFloor(volume / volumeStep) * volumeStep;
 
    int volumeDigits = 0;
    double step = volumeStep;
@@ -432,39 +672,48 @@ double NormalizeVolume(const double rawVolume)
       volumeDigits++;
    }
 
-   return NormalizeDouble(volume, volumeDigits);
+   return NormalizeDouble(
+      volume,
+      volumeDigits
+   );
 }
 
 //+------------------------------------------------------------------+
-//| Find this EA's open position                                      |
+//| Find EA position                                                  |
 //+------------------------------------------------------------------+
 ulong FindOurPosition()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      const ulong ticket = PositionGetTicket(i);
+      ulong ticket = PositionGetTicket(i);
 
       if(ticket == 0)
          continue;
 
-      const string symbol = PositionGetString(POSITION_SYMBOL);
-      const long magic = PositionGetInteger(POSITION_MAGIC);
+      string symbol =
+         PositionGetString(POSITION_SYMBOL);
 
-      if(symbol == _Symbol && magic == InpMagicNumber)
+      long magic =
+         PositionGetInteger(POSITION_MAGIC);
+
+      if(symbol == _Symbol &&
+         magic == InpMagicNumber)
+      {
          return ticket;
+      }
    }
 
    return 0;
 }
 
 //+------------------------------------------------------------------+
-//| Check whether any position exists on the current symbol           |
+//| Check for any position on current symbol                          |
 //+------------------------------------------------------------------+
 bool HasAnyPositionOnSymbol()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      const ulong ticket = PositionGetTicket(i);
+      ulong ticket = PositionGetTicket(i);
 
       if(ticket == 0)
          continue;
@@ -477,13 +726,15 @@ bool HasAnyPositionOnSymbol()
 }
 
 //+------------------------------------------------------------------+
-//| Compare stop-loss values                                          |
+//| Check whether proposed stop is better                             |
 //+------------------------------------------------------------------+
-bool IsBetterStop(const bool isBuy,
-                  const double proposedSL,
-                  const double referenceSL)
+bool IsBetterStop(
+   const bool isBuy,
+   const double proposedSL,
+   const double referenceSL
+)
 {
-   const double tickSize =
+   double tickSize =
       SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
 
    if(referenceSL == 0.0)
@@ -496,16 +747,20 @@ bool IsBetterStop(const bool isBuy,
 }
 
 //+------------------------------------------------------------------+
-//| Respect minimum stop distance for a new trade                     |
+//| Adjust initial stop                                               |
 //+------------------------------------------------------------------+
-double AdjustInitialStop(const ENUM_ORDER_TYPE orderType,
-                         const double proposedSL)
+double AdjustInitialStop(
+   const ENUM_ORDER_TYPE orderType,
+   const double proposedSL
+)
 {
    MqlTick tick;
+
    if(!SymbolInfoTick(_Symbol, tick))
       return proposedSL;
 
-   const double minDistance = GetMinimumStopDistance();
+   double minDistance =
+      GetMinimumStopDistance();
 
    if(orderType == ORDER_TYPE_BUY)
       return MathMin(proposedSL, tick.bid - minDistance);
@@ -514,13 +769,16 @@ double AdjustInitialStop(const ENUM_ORDER_TYPE orderType,
 }
 
 //+------------------------------------------------------------------+
-//| Respect minimum stop distance when modifying a position           |
+//| Adjust managed stop                                               |
 //+------------------------------------------------------------------+
-double AdjustManagedStop(const bool isBuy,
-                         const double proposedSL,
-                         const MqlTick &tick)
+double AdjustManagedStop(
+   const bool isBuy,
+   const double proposedSL,
+   const MqlTick &tick
+)
 {
-   const double minDistance = GetMinimumStopDistance();
+   double minDistance =
+      GetMinimumStopDistance();
 
    if(isBuy)
       return MathMin(proposedSL, tick.bid - minDistance);
@@ -529,53 +787,58 @@ double AdjustManagedStop(const bool isBuy,
 }
 
 //+------------------------------------------------------------------+
-//| Broker minimum stop/freeze distance                               |
+//| Minimum stop distance                                             |
 //+------------------------------------------------------------------+
 double GetMinimumStopDistance()
 {
-   const double point =
+   double point =
       SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
-   const long stopsLevel =
+   long stopsLevel =
       SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
 
-   const long freezeLevel =
+   long freezeLevel =
       SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
 
-   const long requiredPoints = MathMax(stopsLevel, freezeLevel);
+   long requiredPoints =
+      MathMax(stopsLevel, freezeLevel);
 
    return requiredPoints * point;
 }
 
 //+------------------------------------------------------------------+
-//| Normalize price to the instrument's tick size                     |
+//| Normalize price                                                   |
 //+------------------------------------------------------------------+
 double NormalizePrice(const double price)
 {
-   const double tickSize =
+   double tickSize =
       SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
 
-   const int digits =
+   int digits =
       (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
    if(tickSize <= 0.0)
       return NormalizeDouble(price, digits);
 
-   const double normalized =
+   double normalized =
       MathRound(price / tickSize) * tickSize;
 
-   return NormalizeDouble(normalized, digits);
+   return NormalizeDouble(
+      normalized,
+      digits
+   );
 }
 
 //+------------------------------------------------------------------+
-//| Check trade-server return code                                    |
+//| Check trade result                                                |
 //+------------------------------------------------------------------+
 bool IsTradeRetcodeSuccessful()
 {
-   const uint retcode = trade.ResultRetcode();
+   uint retcode = trade.ResultRetcode();
 
-   return retcode == TRADE_RETCODE_DONE ||
-          retcode == TRADE_RETCODE_DONE_PARTIAL ||
-          retcode == TRADE_RETCODE_PLACED;
+   return
+      retcode == TRADE_RETCODE_DONE ||
+      retcode == TRADE_RETCODE_DONE_PARTIAL ||
+      retcode == TRADE_RETCODE_PLACED;
 }
 //+------------------------------------------------------------------+
