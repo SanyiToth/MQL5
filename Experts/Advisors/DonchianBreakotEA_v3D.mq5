@@ -3,7 +3,7 @@
 //|   Donchian breakout H4 – szigorúbb szűrés + kisebb DD            |
 //+------------------------------------------------------------------+
 #property strict
-#property version "3.02"
+#property version "3.10"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -33,12 +33,15 @@ input int  InpSlowEMAPeriod    = 200;
 input int    InpATRPeriod           = 14;
 input double InpMinATRMultiplier    = 0.40;
 input double InpMinBreakoutRangeATR = 0.80;
+input double InpMaxBreakoutRangeATR = 2.00; // tul nagy impulzusgyertya tiltasa
+input double InpMaxBreakoutExtATR   = 0.35; // max. zaroar-tavolsag a csatornatol
+input double InpMaxSpreadATR        = 0.10; // spread legfeljebb az ATR 10%-a
 
 //==================================================================
 // RISK SETTINGS (DD-CSÖKKENTŐ)
 //==================================================================
 
-input double InpRiskPercent   = 1.00;
+input double InpRiskPercent   = 0.50;
 input double InpInitialSL_ATR = 1.50;  // volt 2.00
 input double InpTakeProfit_R  = 2.00;  // volt 3.00
 
@@ -66,9 +69,10 @@ input bool InpOnePositionOnly = true;
 // DRAWDOWN CONTROL
 //==================================================================
 
-input double InpMaxDrawdownPercent   = 25.0;
-input double InpRiskScaleOnDrawdown  = 0.30; // volt 0.50
-input int    InpMaxConsecutiveLosses = 4;
+input double InpRiskReductionStartDD = 2.0;  // eddig teljes kockazat
+input double InpMaxDrawdownPercent   = 8.0;  // innen nincs uj belepes
+input double InpRiskScaleOnDrawdown  = 0.25; // minimum kockazati szorzo
+input int    InpMaxConsecutiveLosses = 3;
 input int    InpCooldownBars         = 20;   // volt 10
 
 //==================================================================
@@ -82,7 +86,7 @@ int      g_slowEMAHandle    = INVALID_HANDLE;
 
 double   g_equityPeak       = 0.0;
 int      g_consecLosses     = 0;
-datetime g_cooldownUntil    = 0;
+int      g_cooldownBarsLeft = 0;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -94,14 +98,32 @@ int OnInit()
    g_midEMAHandle  = iMA(_Symbol, InpTimeframe, InpMidEMAPeriod,  0, MODE_EMA, PRICE_CLOSE);
    g_slowEMAHandle = iMA(_Symbol, InpTimeframe, InpSlowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
 
+   if(g_fastEMAHandle == INVALID_HANDLE ||
+      g_midEMAHandle  == INVALID_HANDLE ||
+      g_slowEMAHandle == INVALID_HANDLE)
+      return INIT_FAILED;
+
+   if(InpRiskPercent <= 0.0 || InpInitialSL_ATR <= 0.0 ||
+      InpTakeProfit_R <= 0.0 || InpATRPeriod <= 0 ||
+      InpDonchianPeriod < 2 || InpMaxDrawdownPercent <= InpRiskReductionStartDD)
+      return INIT_PARAMETERS_INCORRECT;
+
    g_lastBarTime = iTime(_Symbol, InpTimeframe, 0);
 
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   g_equityPeak   = eq;
+   g_equityPeak   = MathMax(eq, AccountInfoDouble(ACCOUNT_BALANCE));
    g_consecLosses = 0;
-   g_cooldownUntil = 0;
+   g_cooldownBarsLeft = 0;
 
    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(g_fastEMAHandle != INVALID_HANDLE) IndicatorRelease(g_fastEMAHandle);
+   if(g_midEMAHandle  != INVALID_HANDLE) IndicatorRelease(g_midEMAHandle);
+   if(g_slowEMAHandle != INVALID_HANDLE) IndicatorRelease(g_slowEMAHandle);
 }
 
 //+------------------------------------------------------------------+
@@ -110,8 +132,16 @@ void OnTick()
    UpdateEquityPeak();
    ManageOpenPosition();
 
-   if(IsNewBar())
-      CheckForEntry();
+   if(!IsNewBar())
+      return;
+
+   if(g_cooldownBarsLeft > 0)
+   {
+      g_cooldownBarsLeft--;
+      return;
+   }
+
+   CheckForEntry();
 }
 
 //+------------------------------------------------------------------+
@@ -126,8 +156,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(deal_ticket == 0)
       return;
 
+   if(!HistoryDealSelect(deal_ticket))
+      return;
+
+   if(HistoryDealGetString(deal_ticket, DEAL_SYMBOL) != _Symbol ||
+      HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != InpMagicNumber)
+      return;
+
    long entryType = HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
-   if(entryType != DEAL_ENTRY_OUT)
+   if(entryType != DEAL_ENTRY_OUT && entryType != DEAL_ENTRY_OUT_BY)
       return;
 
    double profit     = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
@@ -142,8 +179,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
       if(g_consecLosses >= InpMaxConsecutiveLosses)
       {
-         int sec = PeriodSeconds(InpTimeframe);
-         g_cooldownUntil = TimeCurrent() + (sec * InpCooldownBars);
+         g_cooldownBarsLeft = InpCooldownBars;
+         g_consecLosses = 0;
       }
    }
    else
@@ -177,9 +214,6 @@ double GetCurrentDrawdownPercent()
 //+------------------------------------------------------------------+
 bool CanTradeNow()
 {
-   if(TimeCurrent() < g_cooldownUntil)
-      return false;
-
    double dd = GetCurrentDrawdownPercent();
    if(dd >= InpMaxDrawdownPercent)
       return false;
@@ -258,6 +292,16 @@ void CheckForEntry()
    if(breakoutRange < atr * InpMinBreakoutRangeATR)
       return;
 
+   // A tul nagy vagy mar messzre futott kitoresek gyakran rossz R:R belepesek.
+   if(InpMaxBreakoutRangeATR > 0.0 &&
+      breakoutRange > atr * InpMaxBreakoutRangeATR)
+      return;
+
+   double breakoutExtension = longSignal ? close - high : low - close;
+   if(InpMaxBreakoutExtATR > 0.0 &&
+      breakoutExtension > atr * InpMaxBreakoutExtATR)
+      return;
+
    double avgRange = 0.0;
    for(int i = 1; i <= InpATRPeriod; i++)
       avgRange += (r[i].high - r[i].low);
@@ -268,6 +312,9 @@ void CheckForEntry()
 
    MqlTick t;
    if(!SymbolInfoTick(_Symbol, t))
+      return;
+
+   if(InpMaxSpreadATR > 0.0 && (t.ask - t.bid) > atr * InpMaxSpreadATR)
       return;
 
    if(longSignal)
@@ -345,7 +392,8 @@ void ManageOpenPosition()
    // Break-even
    if(InpUseBreakEven && profit >= risk * InpBreakEvenAt_R)
    {
-      double be = open;
+      double offset = InpBreakEvenOffsetPts * _Point;
+      double be = buy ? open + offset : open - offset;
       if(IsBetterStop(buy, be, sl))
       {
          newSL = be;
@@ -397,12 +445,22 @@ double ATR(int shift, int period)
 //+------------------------------------------------------------------+
 double CalcVolume(ENUM_ORDER_TYPE type, double entry, double sl)
 {
-   double bal       = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskMoney = bal * InpRiskPercent / 100.0;
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * InpRiskPercent / 100.0;
 
    double dd = GetCurrentDrawdownPercent();
-   if(dd > 0.0)
-      riskMoney *= InpRiskScaleOnDrawdown;
+   if(dd >= InpMaxDrawdownPercent)
+      return 0.0;
+
+   // Linearis kockazatcsokkentes: nincs hirtelen vagas minimalis DD-nel.
+   if(dd > InpRiskReductionStartDD)
+   {
+      double range = InpMaxDrawdownPercent - InpRiskReductionStartDD;
+      double progress = (dd - InpRiskReductionStartDD) / range;
+      double minFactor = MathMax(0.0, MathMin(1.0, InpRiskScaleOnDrawdown));
+      double riskFactor = 1.0 - progress * (1.0 - minFactor);
+      riskMoney *= MathMax(minFactor, riskFactor);
+   }
 
    double profit1lot = 0.0;
    if(!OrderCalcProfit(type, _Symbol, 1.0, entry, sl, profit1lot))
@@ -424,7 +482,15 @@ double CalcVolume(ENUM_ORDER_TYPE type, double entry, double sl)
    double v = MathMin(raw, maxV);
    v = MathFloor(v / step) * step;
 
-   return NormalizeDouble(v, 2);
+   int volumeDigits = 0;
+   double tmp = step;
+   while(volumeDigits < 8 && MathAbs(tmp - MathRound(tmp)) > 0.00000001)
+   {
+      tmp *= 10.0;
+      volumeDigits++;
+   }
+
+   return NormalizeDouble(v, volumeDigits);
 }
 
 //+------------------------------------------------------------------+
@@ -447,7 +513,8 @@ bool HasAnyPositionOnSymbol()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+      ulong ticket = PositionGetTicket(i);
+      if(ticket != 0 && PositionGetString(POSITION_SYMBOL) == _Symbol)
          return true;
    }
    return false;
@@ -470,6 +537,10 @@ bool IsBetterStop(bool buy, double proposed, double current)
 //+------------------------------------------------------------------+
 double NormalizePrice(double p)
 {
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize > 0.0)
+      p = MathRound(p / tickSize) * tickSize;
+
    int d = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    return NormalizeDouble(p, d);
 }
